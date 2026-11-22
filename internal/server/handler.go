@@ -1484,6 +1484,13 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				log.Printf("model fallback: %s -> %s (no account for model, 6004 blocked)", curModel, to)
 				if applyFallback(to) {
 					st.modelEff = to
+					// [fork 改动 2026-11-22] 换模型时清空按原模型累积的 tried：
+					// tried 记录的是「原模型上已试过的账号」，模型换了这些账号
+					// 对新模型仍有意义（modelCooldowns 是按模型隔离的）。不清空
+					// 的话第一个 pick 立刻 nil（全员 tried）→ 白白 503，降级形同虚设。
+					for k := range tried {
+						delete(tried, k)
+					}
 					continue
 				}
 			}
@@ -1661,23 +1668,19 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			//
 			// ⚠️ 冷却必须记在 **bareModel**（原模型）名下——见函数内 applyErrorPolicy
 			// 调用处。若误记成等价模型，会把本来好好的等价模型也冷却掉，降级白做。
-			if kind == upstream.ErrSoftRate && upstream.IsModelRateLimit(string(respBody)) {
-				if to := fallbackTo(); to != "" {
-					// 先按原模型罚账号/记冷却（限流的是原模型），再切等价模型重试。
-					h.applyErrorPolicy(acct.UID, kind, string(respBody), bareModel, uerr)
-					savedBare := bareModel
-					if applyFallback(to) {
-						st.modelEff = to
-						// 同账号重试：把该账号从 tried 移除（降级是「换模型」不是「换号」，
-						// 同一账号仍应有机会），并让 sticky 保持（本请求内不重绑）。
-						delete(tried, acct.UID)
-						bareModel = savedBare // 冷却记账口径不变，仅 curModel 改了
-						releaseHeld()
-						log.Printf("model fallback: %s -> %s (6004 model rate limit, uid=%s)", savedBare, to, acct.UID)
-						continue
-					}
-				}
-			}
+			// [fork 改动 2026-11-22] 6004「模型级限流」不再立即同账号降级。
+			//
+			// 原实现：配置了 pool.model_fallback 后，第一次 6004 就在本账号上改道
+			// 等价模型（delete(tried) 同账号重试）。多号池下这是抢跑：账号 A 限流
+			// 不代表账号 B/C 也限流——6004 是 (账号, 模型) 级冷却（见 cooldown.go
+			// 「为什么必须模型级」），正确顺序是先把其他账号的同类模型用完，
+			// 全池该模型都停摆时才轮到降级兜底（下方 acct==nil 分支的
+			// 「no account for model」路径，20261021 补的真实缺口）。
+			//
+			// 删掉本分支后 6004 自然走通用错误路径：applyErrorPolicy 给
+			// (本账号, 原模型) 记冷却 → fail() 释放 → 下一轮选号跳过本账号、
+			// 同模型继续（账号切换）。降级只在全池选不到号时发生。
+			_ = kind // kind/uerr 供下方通用路径使用，此处占位防 unused 报错
 			// 内容拦截误报（passthrough/append 模式）：三层抢救，从「改动最小」到「改动最大」。
 			// 每一层都只在本来就会失败的请求上多花一次上游调用，正常流量零影响。
 			//   ① SplitSystemMessages：按句界把 system 拆成多条，**仍在 system 里**，
